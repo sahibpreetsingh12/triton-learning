@@ -17,16 +17,25 @@ import triton.language as tl
 
 @triton.jit
 def vector_add_kernel(A_ptr, B_ptr, C_ptr, N, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)                        # Which block am I? (1D launch)
+    # Think of program_id as "which worker am I?" 
+    # If you have 1024 elements and split into chunks of 256, you get 4 workers
+    # Each worker gets program_id 0, 1, 2, or 3
+    pid = tl.program_id(0)                        
     print("process id is ",pid)
-    block_start = pid * BLOCK_SIZE                # Start index of my chunk
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)  # My thread's element indices
+    
+    # A "block" is just a chunk of data that one worker handles
+    # BLOCK_SIZE = how many elements each worker processes
+    # It's like dividing a pizza into slices - each worker gets one slice
+    # We pick 256 because it's a sweet spot for GPU memory and parallelism
+    block_start = pid * BLOCK_SIZE                
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)  # these are the actual array indices this worker will touch
 
-    mask = offsets < N                            # Avoid reading out of bounds
-    a = tl.load(A_ptr + offsets, mask=mask)       # Load A[block]
-    b = tl.load(B_ptr + offsets, mask=mask)       # Load B[block]
+    # Last worker might get fewer elements than BLOCK_SIZE, mask handles this
+    mask = offsets < N                            
+    a = tl.load(A_ptr + offsets, mask=mask)       # load my slice of array A
+    b = tl.load(B_ptr + offsets, mask=mask)       # load my slice of array B
     c = a + b
-    tl.store(C_ptr + offsets, c, mask=mask)       # Store result
+    tl.store(C_ptr + offsets, c, mask=mask)       # write my results back
 
 N = 1024
 BLOCK_SIZE = 256
@@ -60,29 +69,40 @@ def matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-  pid_m = tl.program_id(0)  # row block id (for A and C)
-  pid_n = tl.program_id(1)  # col block id (for B and C)
+  # Now we have 2D workers! Each worker handles a rectangular "tile" of the output matrix
+  # If output is 128x128 and BLOCK_SIZE=64, we get 2x2 = 4 workers total
+  pid_m = tl.program_id(0)  # which row of tiles am I working on?
+  pid_n = tl.program_id(1)  # which column of tiles am I working on?
 
-  # Compute row and col offsets for this tile of C
+  # Figure out which rows and columns of the final matrix this worker handles
+  # Worker (0,0) handles rows 0-63, cols 0-63. Worker (1,0) handles rows 64-127, cols 0-63, etc.
   offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
   offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-  # Initialize accumulator
+  # Each worker accumulates its tile result here
   acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-  # Loop over tiles in K dimension
+  # Matrix multiplication needs to loop through the K dimension
+  # We break K into chunks too for better memory usage (this is called "tiling")
   for k in range(0, K, BLOCK_SIZE_K):
       offs_k = k + tl.arange(0, BLOCK_SIZE_K)
 	# following pytorch row major format
 
-      # Load tiles from A and B
+      # Stride is basically "how far to jump to get to the next element"
+      # For a 2D matrix stored as 1D array, stride tells us memory layout
+      # stride_am = how many bytes to skip to go down one row in matrix A
+      # stride_ak = how many bytes to skip to go right one column in matrix A
+      # Think of it like: element[i,j] = base_ptr + i*row_stride + j*col_stride
+      
+      # Load a "tile" (small rectangle) from A and B
+      # The [:, None] and [None, :] stuff creates 2D indexing from 1D ranges
       A_tile = tl.load(A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
       B_tile = tl.load(B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
 
-      # Accumulate partial dot product
+      # Do the actual math: multiply the tiles and add to our running total
       acc += tl.dot(A_tile, B_tile)
 
-    # Write back to C
+    # Write our final tile result back to the output matrix
   tl.store(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 # Matrix dimensions
@@ -94,10 +114,13 @@ A = torch.randn((M, K), device='cuda', dtype=torch.float32)
 B = torch.randn((K, N), device='cuda', dtype=torch.float32)
 C = torch.empty((M, N), device='cuda', dtype=torch.float32)
 
-# Define grid dimensions — this is what defines program_id(0), program_id(1)
+# This grid thing is crucial - it tells Triton how many workers to spawn
+# Think of it like: "I need a 2x2 grid of workers to cover my 128x128 output matrix"
+# Each worker handles a 64x64 tile, so we need 128/64 = 2 workers per dimension
+# The lambda just passes our block sizes to the calculation
 grid = lambda META: (
-    triton.cdiv(M, META['BLOCK_SIZE_M']),  # number of row tiles
-    triton.cdiv(N, META['BLOCK_SIZE_N']),  # number of col tiles
+    triton.cdiv(M, META['BLOCK_SIZE_M']),  # how many row tiles do we need?
+    triton.cdiv(N, META['BLOCK_SIZE_N']),  # how many column tiles do we need?
 )
 
 # Launch the kernel
@@ -111,4 +134,25 @@ matmul_kernel[grid](
 )
 
 C
+
+# Quick recap of key concepts for beginners:
+#
+# BLOCK vs TILE - people use these terms interchangeably, but:
+# - BLOCK usually refers to the chunk size (like 64, 256)  
+# - TILE usually refers to the actual data chunk being processed
+#
+# Why these specific block sizes (64, 256)?
+# - GPU memory works best with certain sizes
+# - Too small = too much overhead, too big = memory issues
+# - Powers of 2 work well with GPU architecture
+#
+# STRIDE is the secret sauce for matrix indexing:
+# - Imagine a 3x3 matrix stored as [1,2,3,4,5,6,7,8,9] in memory
+# - To go to next row, you skip 'stride_row' positions (usually width of matrix)
+# - To go to next column, you skip 'stride_col' positions (usually 1)
+# - So element[1,2] = base + 1*stride_row + 2*stride_col = base + 1*3 + 2*1 = base + 5
+#
+# PROGRAM_ID is just your worker's unique identifier:
+# - Think of it as your employee ID in a company
+# - Triton looks at this ID to know which chunk of work you should handle
 

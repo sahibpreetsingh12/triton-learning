@@ -16,19 +16,25 @@ import triton.language as tl
 
 @triton.jit
 def softmax_row_no_mask(X_ptr, Y_ptr, BLOCK: tl.constexpr):
-    # offsets: positions 0..BLOCK-1 in the row
+    # This kernel handles one complete row at a time - no chunking needed
+    # Think of it like: "I'm worker 0 and I handle the entire row in one go"
+    # BLOCK size equals the row length, so no masking or loops required
+    
+    # Generate indices 0, 1, 2, ... BLOCK-1 for this row
     offs = tl.arange(0, BLOCK)
 
-    # load the whole row as a vector
+    # Load the entire row into GPU registers as one vector operation
+    # This is much faster than loading elements one by one
     x = tl.load(X_ptr + offs).to(tl.float32)
 
-    # numerically stable softmax
-    m = tl.max(x, axis=0)
-    ex = tl.exp(x - m)
-    denom = tl.sum(ex, axis=0)
-    y = ex / denom
+    # Softmax math: exp(x-max) / sum(exp(x-max))
+    # We subtract max first to avoid overflow (numerically stable)
+    m = tl.max(x, axis=0)         # find the biggest number in this row
+    ex = tl.exp(x - m)            # subtract max, then exponentiate
+    denom = tl.sum(ex, axis=0)    # sum all the exponentials
+    y = ex / denom                # divide each by the sum = softmax!
 
-    # write back
+    # Write the softmax result back to memory
     tl.store(Y_ptr + offs, y)
 
 def softmax_one_row_simple(x: torch.Tensor) -> torch.Tensor:
@@ -36,7 +42,9 @@ def softmax_one_row_simple(x: torch.Tensor) -> torch.Tensor:
     N = x.numel()
     y = torch.empty_like(x, dtype=torch.float32)
 
-    # BLOCK == N → no masks, no loops
+    # Launch just 1 worker (that's what (1,) means) to handle the whole row
+    # BLOCK == N means our block size exactly matches the row length
+    # No need for masks or loops since we process everything in one shot
     softmax_row_no_mask[(1,)](x, y, BLOCK=N, num_warps=1)
     return y
 
@@ -139,43 +147,54 @@ import triton.language as tl
 @triton.jit
 def softmax_kernel(X_ptr, Y_ptr, M, N, BLOCK_SIZE:  tl.constexpr):
 
-    # Row index for this program
+    # Each worker gets a unique row to process
+    # If we have 4 rows, we'll launch 4 workers with program_id 0,1,2,3
     row_id = tl.program_id(0)
 
-    # since pytorch stores address in Row Major Format
+    # Here's the key insight: PyTorch stores matrices in "row-major" format
+    # This means row 0 is at positions [0,1,2,3], row 1 at [4,5,6,7], etc.
+    # So to jump to row 1, we skip N elements (where N = row width)
     row_start = row_id * BLOCK_SIZE
 
-    # Column offsets for the BLOCK
+    # Generate column indices for this row: [0, 1, 2, ... BLOCK_SIZE-1]
+    # These will be added to row_start to get the actual memory addresses
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
-    # Pointers to this row's data
+    # Build the actual memory addresses for our row
+    # Example: row_id=1, BLOCK_SIZE=4 → row_start=4, col_offsets=[0,1,2,3]
+    # Final addresses: [4+0, 4+1, 4+2, 4+3] = [4,5,6,7] = row 1's data
     X_row_ptr = X_ptr + row_start + col_offsets
     Y_row_ptr = Y_ptr + row_start + col_offsets
 
-    # Load row into registers (no masking here)
+    # Load the entire row at once (vectorized load - very efficient!)
     x = tl.load(X_row_ptr)
 
-    # Step 1: Find max for numerical stability
+    # Standard softmax algorithm:
+    # Step 1: Subtract max for numerical stability (prevents overflow)
     row_max = tl.max(x, axis=0)
     x = x - row_max
 
-    # Step 2: Exponentiate
+    # Step 2: Take exponential of each element
     exp_x = tl.exp(x)
 
-    # Step 3: Sum all exponentials
+    # Step 3: Sum all the exponentials to get normalization factor
     row_sum = tl.sum(exp_x, axis=0)
 
-    # Step 4: Divide to get softmax
+    # Step 4: Divide each exponential by the sum = softmax!
     y = exp_x / row_sum
 
-    # Store the results
+    # Write the softmax results back to memory
     tl.store(Y_row_ptr, y)
 
 
 def softmax_triton(X):
     M, N = X.shape
     Y = torch.empty_like(X)
-    # Launch M programs, one per row
+    
+    # This is where the magic happens: launch exactly M workers
+    # If matrix is 4x8, we launch 4 workers (one per row)
+    # Each worker gets program_id 0,1,2,3 and handles its assigned row
+    # BLOCK_SIZE=N means each worker processes the full row width
     softmax_kernel[(M,)](X, Y, M, N, BLOCK_SIZE=N)
     return Y
 
@@ -192,4 +211,26 @@ Y_torch = torch.softmax(X, dim=1)
 # torch.allclose is a PyTorch function used to determine if two tensors are element-wise equal within a specified
 # tolerance.
 print(torch.allclose(Y_triton, Y_torch, atol=1e-6))
+
+# Key concepts recap for row-wise softmax:
+#
+# ROW-MAJOR MEMORY LAYOUT:
+# - PyTorch stores matrices row by row in memory
+# - For a 3x4 matrix: [row0_col0, row0_col1, row0_col2, row0_col3, row1_col0, ...]
+# - To jump to row N, skip N * row_width elements
+#
+# PROGRAM_ID for row processing:
+# - Each worker gets assigned exactly one row to process
+# - program_id(0) = 0,1,2,3... tells worker which row is theirs
+# - Much simpler than 2D tiling since we don't chunk within rows
+#
+# WHY ROW-WISE SOFTMAX?
+# - Softmax is typically applied along the last dimension (columns)
+# - Each row becomes a probability distribution that sums to 1
+# - Perfect for attention mechanisms, classification outputs, etc.
+#
+# VECTORIZED OPERATIONS:
+# - Load entire row at once instead of element by element
+# - GPU can process multiple elements in parallel within each row
+# - Much faster than sequential processing
 

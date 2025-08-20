@@ -20,61 +20,76 @@ import triton.language as tl
 # ---------------------------------------
 # Tunables (start here)
 # ---------------------------------------
-BLOCK_M = 64
-BLOCK_N = 64
-BLOCK_K = 32
-NUM_WARPS = 4
-NUM_STAGES = 2
+# Think of these as the "tile sizes" - how big chunks we process at once
+# Bigger blocks = more work per thread but higher memory usage
+BLOCK_M = 64   # How many rows of C each program computes
+BLOCK_N = 64   # How many columns of C each program computes
+BLOCK_K = 32   # How we chunk the inner dot product (the K dimension)
+NUM_WARPS = 4  # GPU execution detail - groups of 32 threads
+NUM_STAGES = 2 # Pipeline depth for hiding memory latency
 
 @triton.jit
 def matmul_kernel(
     A_ptr, B_ptr, C_ptr,
     M, N, K,
-    stride_am, stride_ak,    # A: [M, K]
-    stride_bk, stride_bn,    # B: [K, N]
-    stride_cm, stride_cn,    # C: [M, N]
-    BLOCK_M: tl.constexpr,   # tile M
+    stride_am, stride_ak,    # A: [M, K] - how to navigate A's memory
+    stride_bk, stride_bn,    # B: [K, N] - how to navigate B's memory
+    stride_cm, stride_cn,    # C: [M, N] - how to navigate C's memory
+    BLOCK_M: tl.constexpr,   # tile M - compile-time constants for optimization
     BLOCK_N: tl.constexpr,   # tile N
     BLOCK_K: tl.constexpr,   # tile K
 ):
-    # 2D program id: which output tile of C this program computes
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    # Each program in the 2D grid computes one rectangular tile of the output C
+    # Think: "I'm responsible for computing C[start_row:end_row, start_col:end_col]"
+    pid_m = tl.program_id(0)  # Which row of the program grid am I?
+    pid_n = tl.program_id(1)  # Which column of the program grid am I?
 
-    # Offsets for the tile this program computes
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # [BM]
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)        # [BN]
-    offs_k = tl.arange(0, BLOCK_K)                          # [BK]
+    # Figure out exactly which elements of C this program will compute
+    # If pid_m=1 and BLOCK_M=64, then I handle rows 64-127 of the result
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # My rows: [64,65,...,127]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)        # My columns: [0,1,...,63]
+    offs_k = tl.arange(0, BLOCK_K)                          # K-chunk indices: [0,1,...,31]
 
-    # Pointers to the first A/B tiles for this program
+    # Create 2D grids of memory addresses using broadcasting magic
+    # offs_m[:, None] reshapes [0,1,2...] into [[0],[1],[2]...] for broadcasting
+    # This gives us a BLOCK_M x BLOCK_K grid of pointers to A elements
     A_tile_ptr = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
     B_tile_ptr = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
-    # Accumulator in fp32
+    # Our running sum - starts at zero, will accumulate partial results
+    # Always use fp32 for accumulation to avoid numerical issues
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Main K loop
+    # The heart of matrix multiplication: chunk the K dimension
+    # We can't load entire rows/columns at once, so we do it in BLOCK_K-sized pieces
     k_iter = 0
     while k_iter < K:
+        # Bounds checking - make sure we don't read past the actual matrix edges
+        # Remember: k_iter advances by BLOCK_K each iteration
         a_mask = (offs_m[:, None] < M) & ((k_iter + offs_k[None, :]) < K)
         b_mask = ((k_iter + offs_k[:, None]) < K) & (offs_n[None, :] < N)
 
+        # Load the current tiles with boundary protection
+        # If we're past the edge, 'other=0.0' ensures we multiply by zero
         A_tile = tl.load(A_tile_ptr, mask=a_mask, other=0.0).to(tl.float32)
         B_tile = tl.load(B_tile_ptr, mask=b_mask, other=0.0).to(tl.float32)
 
-        # Microkernel
+        # The actual computation: accumulate this partial dot product
+        # This is like one step of C[i,j] += A[i,k] * B[k,j] for our tile
         acc += tl.dot(A_tile, B_tile)
 
-        # Bump pointers along K
+        # Slide our pointers to the next K-chunk
+        # A moves right (next columns), B moves down (next rows)
         A_tile_ptr += BLOCK_K * stride_ak
         B_tile_ptr += BLOCK_K * stride_bk
         k_iter += BLOCK_K
 
-    # Write back (downcast optional)
+    # Time to write our computed tile back to the output matrix
+    # Create pointers to where our results should go in C
     C_tile_ptr = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 
-    # Store as fp16/bf16 if desired; start with fp32 for debugging
+    # Final result - could convert to lower precision here for memory savings
     C_out = acc  # .to(tl.float16) or .to(tl.bfloat16) once you're confident
     tl.store(C_tile_ptr, C_out, mask=c_mask)
 
@@ -84,32 +99,39 @@ def triton_matmul(A: torch.Tensor, B: torch.Tensor,
                   num_warps=NUM_WARPS, num_stages=NUM_STAGES,
                   out_dtype=torch.float32) -> torch.Tensor:
     """
-    Minimal launcher: C = A @ B
-    A: [M, K], B: [K, N]
-    Accumulates in fp32; output dtype selectable.
+    The Python wrapper that launches our GPU kernel
+    Handles all the setup and validation before calling the actual computation
     """
-    assert A.is_cuda and B.is_cuda
-    assert A.is_contiguous() and B.is_contiguous()
-    M, K = A.shape
-    Kb, N = B.shape
-    assert K == Kb
+    # Safety checks - fail fast rather than getting cryptic GPU errors
+    assert A.is_cuda and B.is_cuda, "Tensors must be on GPU for Triton kernels"
+    assert A.is_contiguous() and B.is_contiguous(), "Need simple memory layout for our stride math"
 
+    # Extract dimensions and verify they make sense for matrix multiplication
+    M, K = A.shape    # A is [rows, cols]
+    Kb, N = B.shape   # B is [rows, cols]
+    assert K == Kb, f"Inner dimensions must match: A has {K} columns, B has {Kb} rows"
+
+    # Allocate output tensor - same device as inputs, but dtype is configurable
     C = torch.empty((M, N), device=A.device, dtype=out_dtype)
 
+    # Figure out how many programs we need to cover the entire output
+    # cdiv = ceiling division, ensures we don't miss any edge tiles
     grid = (
-        triton.cdiv(M, block_m),
-        triton.cdiv(N, block_n),
+        triton.cdiv(M, block_m),  # How many row-blocks needed?
+        triton.cdiv(N, block_n),  # How many column-blocks needed?
     )
 
+    # Launch the kernel with our calculated grid
+    # Each program gets the same arguments but uses its program_id to know which tile to compute
     matmul_kernel[grid](
-        A, B, C,
-        M, N, K,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        C.stride(0), C.stride(1),
-        block_m, block_n, block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        A, B, C,                          # The actual tensor data
+        M, N, K,                          # Dimensions for bounds checking
+        A.stride(0), A.stride(1),         # How A is laid out in memory
+        B.stride(0), B.stride(1),         # How B is laid out in memory
+        C.stride(0), C.stride(1),         # How C is laid out in memory
+        block_m, block_n, block_k,        # Tile sizes (compile-time constants)
+        num_warps=num_warps,              # GPU execution tuning
+        num_stages=num_stages,            # Pipeline tuning
     )
     return C
 
@@ -169,7 +191,7 @@ if __name__ == "__main__":
         print(f"[check] {M}x{K} @ {K}x{N}: allclose={ok}")
 
     # ---- quick benchmark ----
-    sizes = [(128,128,1024), (256,256,1024)]
+    sizes = [(128,128,128), (256,256,256)]
     for (M, N, K) in sizes:
         tri_ms, torch_ms = _bench(M, N, K, dtype=torch.float16, out_dtype=torch.float32)
         print(f"[bench] {M}x{K} @ {K}x{N} -> Triton: {tri_ms:.3f} ms | Torch(fp32): {torch_ms:.3f} ms")

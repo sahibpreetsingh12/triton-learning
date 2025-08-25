@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 """practice-3-4.ipynb
-Original file is located at
-    https://colab.research.google.com/drive/12YQ6QjVZsvVO4buGSduuyqWkqOlskz0Z
 """
-
 !pip install triton
 !nvidia-smi
 

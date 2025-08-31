@@ -43,6 +43,7 @@ def attention_kernel(
     query = tl.load(q_ptrs, mask=dim_mask, other=0.0)
 
     # Initialize scores array
+
     scores = tl.full([BLOCK_SIZE_SEQ], value=-float('inf'), dtype=tl.float32)
 
     # Compute attention scores for all keys

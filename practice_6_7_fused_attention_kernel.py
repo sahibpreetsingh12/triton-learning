@@ -4,8 +4,6 @@
 practice-6-7-fused-attention-kernel.ipynb
 """
 
-!pip install triton
-
 import torch
 import triton
 import triton.language as tl

@@ -76,4 +76,5 @@ Temporary Items
 
 # Temporary files
 *.tmp
-*.temp
+*.temptriton_optimization_notes.md
+triton_optimization_notes.md

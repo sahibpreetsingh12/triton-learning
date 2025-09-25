@@ -78,3 +78,4 @@ Temporary Items
 *.tmp
 *.temptriton_optimization_notes.md
 triton_optimization_notes.md
+tiling_memory_offsets_cheatsheet.md

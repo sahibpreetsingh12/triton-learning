@@ -79,3 +79,4 @@ Temporary Items
 *.temptriton_optimization_notes.md
 triton_optimization_notes.md
 tiling_memory_offsets_cheatsheet.md
+flash_attention_practice_template.py
